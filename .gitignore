@@ -6,10 +6,16 @@
 
 # Secrets
 .env
+# Arduino WiFi credentials (keep arduino_secrets.h.example tracked as a template)
+arduino_secrets.h
+
+# Downloaded cloudflared binary
+cloudflared
 
 # Captured images
 capture_*.jpg
 capture_*.bin
+captures/
 
 # Python
 __pycache__/

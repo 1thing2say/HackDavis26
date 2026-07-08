@@ -1,3 +1,0 @@
-wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm64 -O cloudflared
-chmod +x cloudflared
-./cloudflared tunnel --url http://localhost:8080

@@ -19,9 +19,10 @@ import os
 import time
 import datetime
 import threading
+import hmac
 import json
 import io
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 
 try:
@@ -33,6 +34,15 @@ except ImportError:
 
 BAUD_RATE = 921600
 WEB_PORT = 8080
+
+# Optional shared-secret auth. If ROBOT_TOKEN is set, every request must carry
+# ?token=<value> (or an X-Robot-Token header). Strongly recommended whenever the
+# UI is reachable beyond localhost (LAN, Tailscale, or a Cloudflare tunnel).
+ROBOT_TOKEN = os.environ.get("ROBOT_TOKEN", "")
+
+# Where captured JPEGs are written, and how many to retain (oldest pruned).
+SAVE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "captures")
+MAX_CAPTURES = 50
 
 VALID_DIRS = {"F", "B", "L", "R", "FL", "FR", "BL", "BR", "S"}
 
@@ -78,6 +88,21 @@ def find_arduino_port():
     return None
 
 
+def _prune_captures():
+    """Keep only the most recent MAX_CAPTURES JPEGs in SAVE_DIR."""
+    try:
+        files = [os.path.join(SAVE_DIR, f) for f in os.listdir(SAVE_DIR)
+                 if f.startswith("capture_") and f.endswith(".jpg")]
+        files.sort(key=os.path.getmtime, reverse=True)
+        for stale in files[MAX_CAPTURES:]:
+            try:
+                os.remove(stale)
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
 class RobotSerial:
     """Thread-safe serial interface to the Arduino."""
 
@@ -88,6 +113,9 @@ class RobotSerial:
         self.speed = 200
         self.connected = False
         self.last_image_path = None
+        # Set by an incoming STOP to abort an in-flight capture so the emergency
+        # stop can grab the serial lock immediately instead of waiting up to 30s.
+        self.abort_capture = threading.Event()
 
     def connect(self):
         try:
@@ -131,11 +159,18 @@ class RobotSerial:
     def send_motor(self, direction, speed=None):
         if speed is None:
             speed = self.speed
+        # An emergency stop must never wait behind a slow capture: signal any
+        # in-flight capture to bail so this call can take the serial lock now.
+        if direction == "S":
+            self.abort_capture.set()
         with self.lock:
             try:
                 cmd = f"CMD:{direction} {speed}\n"
                 self.ser.write(cmd.encode('ascii'))
                 self.ser.flush()
+                if direction == "S":
+                    # Stop delivered; re-arm captures.
+                    self.abort_capture.clear()
                 # Quick ack read
                 deadline = time.time() + 0.3
                 while time.time() < deadline:
@@ -154,6 +189,9 @@ class RobotSerial:
 
     def capture_image(self):
         with self.lock:
+            # A stop is pending and waiting for this lock — yield to it immediately.
+            if self.abort_capture.is_set():
+                return None, "aborted (stop pending)"
             try:
                 self.ser.reset_input_buffer()
                 self.ser.write(b'S')
@@ -163,6 +201,8 @@ class RobotSerial:
                 timeout_start = time.time()
 
                 while True:
+                    if self.abort_capture.is_set():
+                        return None, "aborted"
                     if time.time() - timeout_start > 30:
                         return None, "Timeout"
 
@@ -199,6 +239,8 @@ class RobotSerial:
 
                     total_needed = 8 + img_length
                     while len(buffer) < total_needed:
+                        if self.abort_capture.is_set():
+                            return None, "aborted"
                         remaining = total_needed - len(buffer)
                         more = self.ser.read(min(remaining, 4096))
                         if more:
@@ -207,12 +249,15 @@ class RobotSerial:
                     img_data = buffer[8:8 + img_length]
 
                     if img_data[:2] == b'\xff\xd8':
+                        os.makedirs(SAVE_DIR, exist_ok=True)
                         ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
                         filename = f"capture_{ts}.jpg"
-                        with open(filename, 'wb') as f:
+                        filepath = os.path.join(SAVE_DIR, filename)
+                        with open(filepath, 'wb') as f:
                             f.write(img_data)
-                        self.last_image_path = os.path.abspath(filename)
-                        print(f"  [Camera] Saved: {filename} ({img_length} bytes)")
+                        self.last_image_path = filepath
+                        _prune_captures()
+                        print(f"  [Camera] Saved: {filepath} ({img_length} bytes)")
                         return img_data, filename
                     else:
                         return None, "Not a JPEG"
@@ -234,9 +279,9 @@ class RobotSerial:
 robot = None
 
 
-def get_html():
-    """Return the control panel HTML."""
-    return """<!DOCTYPE html>
+def get_html(token=""):
+    """Return the control panel HTML, embedding the auth token if one is set."""
+    return ("""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
@@ -480,6 +525,11 @@ def get_html():
 <div class="log" id="log"></div>
 
 <script>
+const TOKEN = __TOKEN__;
+function withTok(u) {
+  if (!TOKEN) return u;
+  return u + (u.includes('?') ? '&' : '?') + 'token=' + encodeURIComponent(TOKEN);
+}
 const speedEl = document.getElementById('speed');
 const speedVal = document.getElementById('speedVal');
 const logEl = document.getElementById('log');
@@ -498,7 +548,7 @@ function log(msg) {
 
 function sendCmd(dir) {
   const speed = speedEl.value;
-  fetch('/api/motor?dir=' + dir + '&speed=' + speed)
+  fetch(withTok('/api/motor?dir=' + dir + '&speed=' + speed))
     .then(r => r.json())
     .then(d => { if (!d.ok) log('ERR: ' + d.error); })
     .catch(e => log('ERR: ' + e));
@@ -598,7 +648,9 @@ function playBeep(dir) {
 let geminiGoal = 'avoid obstacles and move forward';
 let geminiLoop = null;
 
-const GEMINI_GAP_MS = 150;  // delay between cycles — lower = more responsive
+const GEMINI_GAP_MS = 800;  // delay between cycles. Each cycle is a capture + a
+                            // Gemini inference, so very low values hammer the API
+                            // (cost + rate limits). Lower cautiously.
 
 function geminiStop(btn, reason) {
   geminiLoop = false;
@@ -624,7 +676,7 @@ function geminiStep() {
   function step() {
     if (!geminiLoop) return;
     const t0 = performance.now();
-    fetch('/api/gemini?goal=' + encodeURIComponent(geminiGoal))
+    fetch(withTok('/api/gemini?goal=' + encodeURIComponent(geminiGoal)))
       .then(r => r.json())
       .then(d => {
         if (!geminiLoop) return;
@@ -647,7 +699,7 @@ function capture() {
   btn.disabled = true;
   btn.textContent = '⏳ Capturing...';
   log('Capturing image...');
-  fetch('/api/capture')
+  fetch(withTok('/api/capture'))
     .then(r => r.json())
     .then(d => {
       btn.disabled = false;
@@ -657,7 +709,7 @@ function capture() {
         const preview = document.getElementById('preview');
         const img = document.getElementById('previewImg');
         const meta = document.getElementById('previewMeta');
-        img.src = '/api/image?t=' + Date.now();
+        img.src = withTok('/api/image?t=' + Date.now());
         meta.textContent = d.filename + ' — ' + d.size + ' bytes';
         preview.style.display = 'block';
       } else {
@@ -672,7 +724,7 @@ function capture() {
 }
 </script>
 </body>
-</html>"""
+</html>""".replace("__TOKEN__", json.dumps(token)))
 
 
 class RobotHTTPHandler(BaseHTTPRequestHandler):
@@ -682,12 +734,23 @@ class RobotHTTPHandler(BaseHTTPRequestHandler):
         # Suppress default access logs
         pass
 
+    def _authorized(self, parsed):
+        if not ROBOT_TOKEN:
+            return True
+        params = parse_qs(parsed.query)
+        supplied = params.get('token', [self.headers.get('X-Robot-Token', '')])[0]
+        return hmac.compare_digest(supplied, ROBOT_TOKEN)
+
     def do_GET(self):
         parsed = urlparse(self.path)
         path = parsed.path
 
+        if not self._authorized(parsed):
+            self._respond(401, 'text/plain', 'Unauthorized')
+            return
+
         if path == '/' or path == '/index.html':
-            self._respond(200, 'text/html', get_html())
+            self._respond(200, 'text/html', get_html(ROBOT_TOKEN))
 
         elif path == '/api/motor':
             params = parse_qs(parsed.query)
@@ -714,8 +777,10 @@ class RobotHTTPHandler(BaseHTTPRequestHandler):
                 self._json(200, {'ok': False, 'error': result})
 
         elif path == '/api/image':
-            if robot.last_image_path and os.path.exists(robot.last_image_path):
-                with open(robot.last_image_path, 'rb') as f:
+            p = robot.last_image_path
+            safe = p and os.path.realpath(p).startswith(os.path.realpath(SAVE_DIR) + os.sep)
+            if safe and os.path.exists(p):
+                with open(p, 'rb') as f:
                     data = f.read()
                 self._respond(200, 'image/jpeg', data, binary=True)
             else:
@@ -768,10 +833,16 @@ def main() -> int:
     if not robot.connect():
         return 1
 
-    # Start web server
-    server = HTTPServer(('0.0.0.0', WEB_PORT), RobotHTTPHandler)
+    # Start web server. Threaded so an emergency STOP is never queued behind a
+    # slow capture or Gemini call in progress on another request thread.
+    server = ThreadingHTTPServer(('0.0.0.0', WEB_PORT), RobotHTTPHandler)
     print(f"\n{'='*50}")
-    print(f"  Web UI: http://localhost:{WEB_PORT}")
+    if ROBOT_TOKEN:
+        print(f"  Web UI: http://localhost:{WEB_PORT}/?token={ROBOT_TOKEN}")
+        print("  Auth:   ON (token required on every request)")
+    else:
+        print(f"  Web UI: http://localhost:{WEB_PORT}")
+        print("  Auth:   OFF — set ROBOT_TOKEN before exposing this beyond localhost!")
 
     # Also show LAN IP for phone access
     import socket

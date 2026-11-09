@@ -1,4 +1,4 @@
-# davishacks: AI Robot Car
+# HackDavis26
 
 <img align="right" width="300" src="assets/workflow.png" alt="The robot car mid-hackathon: an Elegoo chassis with a wooden gripper arm, ultrasonic sensor, a nest of jumper wires over the Arduino and breadboard, tethered by USB to a MacBook">
 
